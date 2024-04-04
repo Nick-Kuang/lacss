@@ -57,7 +57,7 @@ class Lacss(object):
             insecure=False,
             compression=None,
             wait_for_ready=None,
-            timeout=None,
+            timeout=500,
             metadata=None):
         return grpc.experimental.unary_unary(request, target, '/trackmate.lacss.Lacss/RunDetection',
             lacss__pb2.Input.SerializeToString,
