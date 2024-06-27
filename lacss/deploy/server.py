@@ -13,12 +13,6 @@ from lacss.ops import patches_to_label, sorted_non_max_suppression
 
 from .predict import Predictor
 
-import os
-from os.path import join
-import tempfile
-import pickle
-
-
 app = typer.Typer(pretty_exceptions_enable=False)
 
 def read_input(st = sys.stdin.buffer):
@@ -78,14 +72,24 @@ def write_polygon_result(polygons, scores, st = sys.stdout.buffer):
 
 @app.command()
 def main(modelpath: Path):
-    
     modelpath = str(modelpath)
-    
+    if "!" in modelpath: # in a jar
+        jarfile, rscpath = modelpath.split("!")
+        with ZipFile(jarfile) as jar:
+            with jar.open(rscpath) as modelfile:
+                import pickle
+                modelpath = pickle.load(modelfile)
 
-    print(f'cellpose_server: Initializing...')
-    
+    model = Predictor(modelpath)
+    model.detector.test_max_output = 512
+    model.detector.test_min_score = 0
 
+    print(f"lacss_server: loaded model from {modelpath}", file=sys.stderr)
+    print(f"lacss_server: default backend is {jax.default_backend()}", file=sys.stderr)
+    if (jax.default_backend() == "cpu"):
+        print(f"lacss_server: WARNING: No GPU configuration. This might be very slow ...", file=sys.stderr)
 
+    # cnt = 0
 
     while True:
         img, settings = read_input()
@@ -96,29 +100,40 @@ def main(modelpath: Path):
 
         print(f"received image {img.shape}", file=sys.stderr)
 
-        with tempfile.TemporaryDirectory as tempdir:
-        
-            os.system("conda run -n cellpose python cellpose_model --image img --dir tempdir")
+        preds = model.predict(
+            img, 
+            min_area=settings.min_cell_area,
+            remove_out_of_bound=settings.remove_out_of_bound,
+            scaling=settings.scaling,
+            nms_iou=settings.nms_iou,
+            score_threshold=settings.detection_threshold,
+            segmentation_threshold=settings.segmentation_threshold,
+            output_type="contour" if settings.return_polygon else "label"
+        )
 
-            f = open(join(tempdir,'storage.pkl'))
-            masks, flows, __, ___ = pickle.load(f)
+        if settings.return_polygon:
 
+            write_polygon_result(
+                preds["pred_contours"],
+                preds["pred_scores"],
+            )
 
-        label = masks.astype("int")
-        scores = flows[:][2]
+        else:
 
-        assert label.max() == len(scores)
+            label = preds["pred_label"].astype("int")
+            scores = preds["pred_scores"]
 
-        assert len(label.shape) == 2
+            assert label.max() == len(scores)
 
-        # score image
-        score_img = scores[label - 1]
-        score_img *= (label > 0)
+            assert len(label.shape) == 2
 
-        assert score_img.shape == label.shape
+            # score image
+            score_img = scores[label - 1]
+            score_img *= (label > 0)
 
-        print(f"cellpose_server: Made prediction... trying to send pred...")
-        write_result(label, score_img)
+            assert score_img.shape == label.shape
+
+            write_result(label, score_img)
 
         # imageio.imwrite(f"p_{cnt}.tif", np.asarray(label))
         # cnt+=1
