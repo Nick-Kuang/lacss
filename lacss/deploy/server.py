@@ -77,6 +77,8 @@ def main(modelpath: Path):
     
     modelpath = str(modelpath)
     
+
+    print(f'cellpose_server: Trying to load cellpose model...')
     model = models.Cellpose(gpu = True, model_type="cyto")
 
     print(f"cellpose_server: loaded model defualt Cyto Model")
