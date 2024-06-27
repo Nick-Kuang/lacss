@@ -73,7 +73,9 @@ def write_polygon_result(polygons, scores, st = sys.stdout.buffer):
     st.write(msg.SerializeToString())
 
 @app.command()
-def main():
+def main(modelpath: Path):
+    
+    modelpath = str(modelpath)
     
     model = models.Cellpose(gpu = True, model_type="cyto")
 
@@ -107,6 +109,7 @@ def main():
 
         assert score_img.shape == label.shape
 
+        print(f"cellpose_server: Made prediction... trying to send pred...")
         write_result(label, score_img)
 
         # imageio.imwrite(f"p_{cnt}.tif", np.asarray(label))
