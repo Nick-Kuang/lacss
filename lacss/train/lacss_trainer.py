@@ -1,96 +1,82 @@
+from __future__ import annotations
+
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
+from typing import Iterable, Optional, Union, Sequence
 
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 import optax
-import orbax.checkpoint
-from flax.training import orbax_utils
+import orbax.checkpoint as ocp
 from tqdm import tqdm
 
-import lacss.losses
 import lacss.metrics
-from lacss.modules import Lacss, LacssCollaborator
-from lacss.types import *
 
+from lacss.losses import (
+    aux_size_loss,
+    collaborator_border_loss,
+    collaborator_segm_loss,
+    lpn_loss,
+    segmentation_loss,
+)
+
+from ..modules import Lacss, UNet
+from ..typing import Array, Optimizer
+from .base_trainer import Trainer
 from .strategy import JIT
-from .trainer import Trainer
+from ..typing import *
 
 
-def segmentation_loss(preds, labels, inputs, pretraining=False):
-    if labels is None:
-        labels = {}
+class LacssCollaborator(nn.Module):
+    """Collaborator module for semi-supervised Lacss training
 
-    if "gt_labels" in labels or "gt_masks" in labels:  # supervised
-        return lacss.losses.supervised_instance_loss(
-            preds=preds,
-            labels=labels,
-            inputs=inputs,
+    Attributes:
+        conv_spec: conv-net specificaiton for cell border predicition
+        unet_spec: specification for unet, used to predict cell foreground
+        patch_size: patch size for the unet
+        n_cls: number of classes (cell types) of input images
+    """
+
+    conv_spec: Sequence[int] = (32, 32)
+    unet_spec: Sequence[int] = (16, 32, 64)
+    patch_size: int = 1
+    n_cls: int = 1
+
+    @nn.compact
+    def __call__(
+        self, image: ArrayLike, cls_id: Optional[ArrayLike] = None
+    ) -> DataDict:
+        assert cls_id is not None or self.n_cls == 1
+        c = cls_id.astype(int).squeeze() if cls_id is not None else 0
+
+        net = UNet(self.unet_spec, self.patch_size)
+        _, unet_out = net(image)
+
+        y = unet_out[str(net.start_level)]
+
+        fg = nn.Conv(self.n_cls, (3, 3))(y)
+        fg = fg[..., c]
+
+        if fg.shape != image.shape[:-1]:
+            fg = jax.image.resize(fg, image.shape[:-1], "linear")
+
+        y = image
+        for n_features in self.conv_spec:
+            y = nn.Conv(n_features, (3, 3), use_bias=False)(y)
+            y = nn.GroupNorm(num_groups=None, group_size=1, use_scale=False)(
+                y[None, ...]
+            )[0]
+            y = jax.nn.relu(y)
+
+        y = nn.Conv(self.n_cls, (3, 3))(y)
+        cb = y[..., c]
+
+        return dict(
+            fg_pred=fg,
+            edge_pred=cb,
         )
-    elif "gt_image_mask" in labels:  # supervised by point + imagemask
-        return lacss.losses.weakly_supervised_instance_loss(
-            preds=preds,
-            labels=labels,
-            inputs=inputs,
-        )
-    else:  # point-supervised
-        return lacss.losses.self_supervised_instance_loss(
-            preds=preds, labels=labels, inputs=inputs, soft_label=not pretraining
-        )
-
-
-def collaborator_segm_loss(preds, labels, inputs, sigma, pi):
-    if not "fg_pred" in preds:
-        return 0.0
-
-    if labels is None:
-        labels = {}
-
-    if "gt_image_mask" in labels or "gt_labels" in labels:
-        return lacss.losses.supervised_segmentation_loss(
-            preds=preds,
-            labels=labels,
-            inputs=inputs,
-        )
-
-    else:
-        return lacss.losses.self_supervised_segmentation_loss(
-            preds=preds,
-            labels=labels,
-            inputs=inputs,
-            offset_sigma=sigma,
-            offset_scale=pi,
-        )
-
-
-def collaborator_border_loss(preds, labels, inputs):
-    if not "edge_pred" in preds:
-        return 0.0
-
-    if labels is None:
-        labels = {}
-
-    if "gt_labels" in labels or "gt_masks" in labels:
-        return 0.0
-
-    else:
-        return lacss.losses.self_supervised_edge_loss(
-            preds=preds,
-            labels=labels,
-            inputs=inputs,
-        )
-
-
-def mc_loss(preds, labels, inputs):
-    if labels is None:
-        labels = {}
-
-    if "gt_labels" in labels or "gt_masks" in labels:
-        return 0.0
-    else:
-        return lacss.losses.aux_size_loss(preds=preds, labels=labels, inputs=inputs)
-
 
 class _CKSModel(nn.Module):
     principal: Lacss
@@ -108,7 +94,7 @@ class _CKSModel(nn.Module):
         return outputs
 
 
-class LacssTrainer(Trainer):
+class LacssTrainer:
     """Main trainer class for Lacss"""
 
     default_lr: float = 0.001
@@ -142,40 +128,26 @@ class LacssTrainer(Trainer):
         else:
             collaborator = LacssCollaborator(**collaborator_config)
 
-        super().__init__(
-            model=_CKSModel(
-                principal=principal,
-                collaborator=collaborator,
-            ),
-            optimizer=optimizer,
-            seed=seed,
-            strategy=strategy,
+        self.model = _CKSModel(
+            principal=principal,
+            collaborator=collaborator,
         )
 
-        if self.optimizer is None:
-            self.optimizer = optax.adamw(LacssTrainer.default_lr)
+        self.optimizer = optimizer or optax.adamw(LacssTrainer.default_lr)
+        self.seed = seed
+        self.strategy = strategy
 
-        self._cp_step = 0
+    def _train_to_next_interval(self, n_steps, trainer, train_iter, cpm, val_dataset):
+        for _ in tqdm(range(n_steps)):
+            next(train_iter)
 
-    def _train_to_next_interval(
-        self, train_iter, checkpoint_interval, checkpoint_dir, val_dataset
-    ):
-        cur_step = self.state.step
-        next_cp_step = (
-            (cur_step + checkpoint_interval)
-            // checkpoint_interval
-            * checkpoint_interval
-        )
+        print("Losses: " + repr(train_iter.loss_logs))
 
-        for _ in tqdm(range(cur_step, next_cp_step)):
-            logs = next(train_iter)
-
-        print(", ".join([f"{k}:{v:.4f}" for k, v in logs.items()]))
-
-        if checkpoint_dir is not None:
-            cps = [int(p.name.split("-")[-1]) for p in checkpoint_dir.glob("chkpt-*")]
-            cp_cnt = max(cps) + 1
-            self.checkpoint(checkpoint_dir / f"chkpt-{cp_cnt}")
+        if cpm is not None:
+            cpm.save(
+                (cpm.latest_step() or 0) + 1,
+                args=ocp.args.StandardSave(train_iter),
+            )
 
         if val_dataset is not None:
             val_metrics = [
@@ -183,74 +155,74 @@ class LacssTrainer(Trainer):
                 lacss.metrics.BoxAP([0.5, 0.75]),
             ]
 
-            var_logs = self.test_and_compute(val_dataset, metrics=val_metrics)
+            var_logs = trainer.compute_metrics(
+                val_dataset,
+                val_metrics,
+                dict(params=train_iter.parameters),
+            )
+
             for k, v in var_logs.items():
                 print(f"{k}: {v}")
 
-    def _validate(self, val_dataset):
-        if val_dataset is not None:
-            val_metrics = [
-                lacss.metrics.LoiAP([5, 2, 1]),
-                lacss.metrics.BoxAP([0.5, 0.75]),
-            ]
+        train_iter.reset_loss_logs()
 
-            var_logs = self.test_and_compute(
-                val_dataset, metrics=val_metrics, strategy=JIT
-            )
-            for k, v in var_logs.items():
-                print(f"{k}: {v}")
-
-    def _make_checkpoint(self, checkpoint_manager):
-        if checkpoint_manager is not None:
-            self._cp_step += 1
-            save_args = orbax_utils.save_args_from_target(self.state)
-            checkpoint_manager.save(
-                self._cp_step,
-                {"config": asdict(self.model), "train_state": self.state},
-                save_kwargs={"train_state": {"save_args": save_args}},
-            )
-
-    def restore_from_checkpoint(
-        self, checkpoint_manager: orbax.checkpoint.CheckpointManager, step: int = -1
-    ) -> None:
-        """Restore train state from a checkpoint.
-
-        Args:
-            checkpoint_manager: Orbax checkpoint manager
-            step: The exact checkpoint to restore. Latest if unspecified.
-        """
-        if step < 0:
-            step = checkpoint_manager.latest_step()
-
-        restore_args = orbax_utils.restore_args_from_target(self.state, None)
-
-        restored = checkpoint_manager.restore(
-            step,
-            items=dict(
-                config={},
-                train_state=self.state,
-            ),
-            restore_kwargs={"train_state": {"restore_args": restore_args}},
+    def _get_warmup_trainer(self, sigma, pi):
+        pre_seg_loss = partial(segmentation_loss, pretraining=True)
+        pre_col_seg_loss = partial(collaborator_segm_loss, sigma=100.0, pi=1.0)
+        losses = [
+            lpn_loss,
+            pre_seg_loss,
+            pre_col_seg_loss,
+            collaborator_border_loss,
+            aux_size_loss,
+        ]
+        return Trainer(
+            model=self.model,
+            losses=losses,
+            optimizer=self.optimizer,
+            seed=self.seed,
+            strategy=self.strategy,
         )
-        self.state = restored["train_state"]
 
-        # reconstruct model or not?
-        # from lacss.utils import dataclass_from_dict
-        # self.model = dataclass_from_dict(restored["config"])
+    def _get_trainer(self, sigma, pi):
+        col_seg_loss = partial(collaborator_segm_loss, sigma=sigma, pi=pi)
+        losses = [
+            lpn_loss,
+            segmentation_loss,
+            col_seg_loss,
+            collaborator_border_loss,
+            aux_size_loss,
+        ]
+        return Trainer(
+            model=self.model,
+            losses=losses,
+            optimizer=self.optimizer,
+            seed=self.seed,
+            strategy=self.strategy,
+        )
 
-        self._cp_step = step
+    def get_init_params(self, dataset):
+        trainer = self._get_trainer(20.0, 2.0)
+        train_it = trainer.train(
+            dataset, 
+            rng_cols=["droppath"],
+            training=True,
+        )
+        return train_it.parameters
+
 
     def do_training(
         self,
-        dataset: DataSource,
-        val_dataset: DataSource = None,
+        dataset: Iterable,
+        val_dataset: Iterable | None = None,
         n_steps: int = 50000,
         validation_interval: int = 5000,
-        checkpoint_manager: Optional[orbax.checkpoint.CheckpointManager] = None,
+        checkpoint_manager: Optional[ocp.CheckpointManager] = None,
         *,
         warmup_steps: int = 0,
         sigma: float = 20.0,
         pi: float = 2.0,
+        init_vars = None,
     ) -> None:
         """Runing training.
 
@@ -276,7 +248,6 @@ class LacssTrainer(Trainer):
                 options = orbax.CheckpointManagerOptions(...)
                 manager = orbax.checkpoint.CheckpointManager(
                     'path/to/directory/',
-                    trainer.get_checkpointer(),
                     options = options
                 )
                 ```
@@ -288,107 +259,80 @@ class LacssTrainer(Trainer):
             sigma: Only for point-supervised training. Expected cell size
             pi: Only for point-supervised training. Amplitude of the prior term.
         """
-        pre_seg_loss = partial(segmentation_loss, pretraining=True)
-        pre_seg_loss.name = "segmentation_loss"
-        pre_col_seg_loss = partial(collaborator_segm_loss, sigma=100.0, pi=1.0)
-        pre_col_seg_loss.name = "collaborator_segm_loss"
-        self.losses = [
-            lacss.losses.lpn_loss,
-            pre_seg_loss,
-            pre_col_seg_loss,
-            collaborator_border_loss,
-            mc_loss,
-        ]
-        train_iter = self.train(dataset, rng_cols=["droppath"], training=True)
+        cur_step = 0
 
-        while self.state.step < n_steps:
-            cur_step = self.state.step
+        if cur_step < warmup_steps:
+            trainer = self._get_warmup_trainer(sigma, pi)
+            train_it = trainer.train(
+                dataset, 
+                rng_cols=["droppath"], 
+                init_vars=init_vars,
+                training=True,
+            )
+
+            while cur_step < warmup_steps:
+                next_cp_step = (
+                    (cur_step + validation_interval)
+                    // validation_interval
+                    * validation_interval
+                )
+
+                print(f"Current step {cur_step} going to {next_cp_step}")
+
+                self._train_to_next_interval(
+                    next_cp_step - cur_step,
+                    trainer,
+                    train_it,
+                    checkpoint_manager,
+                    val_dataset,
+                )
+
+                cur_step = next_cp_step
+
+                self.parameters = train_it.parameters
+
+            init_vars = dict(params=train_it.parameters)
+
+        trainer = self._get_trainer(sigma, pi)
+        train_it = trainer.train(
+            dataset,
+            rng_cols=["droppath"],
+            init_vars=init_vars,
+            training=True,
+        )
+
+        while cur_step < n_steps:
             next_cp_step = (
                 (cur_step + validation_interval)
                 // validation_interval
                 * validation_interval
             )
 
-            if cur_step >= warmup_steps:
-                col_seg_loss = partial(collaborator_segm_loss, sigma=sigma, pi=pi)
-                col_seg_loss.name = "collaborator_segm_loss"
-                self.losses = [
-                    lacss.losses.lpn_loss,
-                    segmentation_loss,
-                    col_seg_loss,
-                    collaborator_border_loss,
-                    mc_loss,
-                ]
-
-            self.reset()
-
             print(f"Current step {cur_step} going to {next_cp_step}")
-            for _ in tqdm(range(cur_step, next_cp_step)):
-                logs = next(train_iter)
 
-            print(", ".join([f"{k}:{v:.4f}" for k, v in logs.items()]))
-            self._make_checkpoint(checkpoint_manager)
-            self._validate(val_dataset)
+            self._train_to_next_interval(
+                next_cp_step - cur_step,
+                trainer,
+                train_it,
+                checkpoint_manager,
+                val_dataset,
+            )
 
-    @classmethod
-    def get_checkpointer(cls) -> orbax.checkpoint.Checkpointer:
-        """Returns a checkpointer obj for this Trainer. Convienent function for creating a checkpoint manager"""
+            cur_step = next_cp_step
 
-        return {
-            "config": orbax.checkpoint.Checkpointer(
-                orbax.checkpoint.JsonCheckpointHandler()
-            ),
-            "train_state": orbax.checkpoint.PyTreeCheckpointer(),
-        }
+            self.parameters = train_it.parameters
 
-    @classmethod
-    def from_checkpoint(cls, cp_path) -> Tuple[nn.Module, Params]:
-        """load the module and its weight from a checkpoint
-            This utility static method allows use checkpoint as a model save. It ignores
-            optstate.
 
-        Args:
-            cp_path: checkpoint location (a dir)
-
-        Returns:
-            A tuple of module and weights.
-        """
-        import json
-
-        cp_path = Path(cp_path)
-
-        with open(cp_path / "config" / "metadata", "r") as f:
-            cfg = json.load(f)
-
-        obj = cls(cfg["principal"], cfg["collaborator"])
-
-        fake_data = dict(
-            image=jnp.zeros([64, 64, 3]),
-            gt_locations=jnp.zeros([8, 2]),
-            cls_id=jnp.asarray(0),
-        )
-        obj.initialize([fake_data], tx=optax.adam(cls.default_lr))
-
-        # restore_args = orbax_utils.restore_args_from_target(self.state, None)
-        obj.state = orbax.checkpoint.PyTreeCheckpointer().restore(
-            cp_path / "train_state",
-            item=obj.state,
-            # restore_args = restore_args,
-            transforms={},
-        )
-
-        return obj
-
-    def pickle(self, save_path) -> None:
-        """Save a pickled copy of the Lacss model in the form of (model_config:dict, weights:FrozenDict). Only saves the principal model.
+    def save(self, save_path) -> None:
+        """Save a pickled copy of the Lacss model in the form of (module:Lacss, weights:FrozenDict). Only saves the principal model.
 
         Args:
             save_path: Path to the pkl file
         """
         import pickle
 
-        _cfg = self.model.principal.get_config(0)
-        _params = self.params["principal"]
+        _module = self.model.principal
+        _params = self.parameters["principal"]
 
         with open(save_path, "wb") as f:
-            pickle.dump((_cfg, _params), f)
+            pickle.dump((_module, _params), f)

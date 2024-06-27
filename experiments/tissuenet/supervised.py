@@ -22,7 +22,7 @@ from data import tfds_from_data_path
 
 import lacss.data
 import lacss.train
-from lacss.deploy import load_from_pretrained
+from lacss.utils import load_from_pretrained
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -143,15 +143,11 @@ def run_training(
 
     cp_mngr = orbax.checkpoint.CheckpointManager(
         logpath,
-        trainer.get_checkpointer(),
     )
 
-    if len(cp_mngr.all_steps()) > 0:
-        trainer.restore_from_checkpoint(cp_mngr)
-
-    elif transfer is not None:
+    if transfer is not None:
         _, params = load_from_pretrained(transfer)
-        trainer.params = params
+        trainer.parameters = params
 
         logging.info(f"Transfer model configuration and weights from {transfer}")
 

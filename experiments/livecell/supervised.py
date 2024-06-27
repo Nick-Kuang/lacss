@@ -1,32 +1,28 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-import os
-
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
-import tensorflow as tf
-
-tf.config.set_visible_devices([], "GPU")
-
 import dataclasses
 import json
 import logging
+
 from pathlib import Path
 from pprint import pprint
 
+import jax
 import numpy as np
 import optax
 import orbax.checkpoint
 import typer
+
 from data import augment, get_cell_type_and_scaling, remove_redundant
 from flax.core.frozen_dict import freeze, unfreeze
 from tqdm import tqdm
 
-import lacss.data
-import lacss.train
-from lacss.deploy import load_from_pretrained
-from lacss.types import *
+from lacss.data import (dataset_from_coco_annotations, random_crop_or_pad,
+                        resize)
+from lacss.train import LacssTrainer, TFDatasetAdapter, VMapped
+from lacss.typing import *
+from lacss.utils import load_from_pretrained
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -39,6 +35,8 @@ def train_data(
     target_size=[544, 544],
     v1_scaling=False,
 ):
+    import tensorflow as tf
+
     v = 1 if v1_scaling else 2
 
     def _train_parser(inputs):
@@ -59,7 +57,7 @@ def train_data(
         )
 
     ds = (
-        lacss.data.dataset_from_coco_annotations(
+        dataset_from_coco_annotations(
             datapath / "annotations" / "LIVECell" / "livecell_coco_train.json",
             datapath / "images" / "livecell_train_val_images",
             [520, 704, 1],
@@ -87,7 +85,7 @@ def train_data(
     print("Train dataset is: ")
     pprint(ds.element_spec)
 
-    return lacss.train.TFDatasetAdapter(ds, steps=-1).get_dataset()
+    return TFDatasetAdapter(ds)
 
 
 def val_data(
@@ -96,6 +94,8 @@ def val_data(
     target_size=[544, 544],
     v1_scaling=False,
 ):
+    import tensorflow as tf
+
     v = 1 if v1_scaling else 2
 
     def _val_parser(inputs, target_size=None):
@@ -112,9 +112,9 @@ def val_data(
         h, w, _ = inputs["image"].shape
         h = tf.round(h * default_scale)
         w = tf.round(w * default_scale)
-        inputs = lacss.data.resize(inputs, target_size=[h, w])
+        inputs = resize(inputs, target_size=[h, w])
         if target_size is not None:
-            inputs = lacss.data.random_crop_or_pad(inputs, target_size=target_size)
+            inputs = random_crop_or_pad(inputs, target_size=target_size)
 
         return dict(image=inputs["image"],), dict(
             gt_locations=inputs["centroids"],
@@ -122,7 +122,7 @@ def val_data(
         )
 
     ds = (
-        lacss.data.dataset_from_coco_annotations(
+        dataset_from_coco_annotations(
             datapath / "annotations" / "LIVECell" / "livecell_coco_val.json",
             datapath / "images" / "livecell_train_val_images",
             [520, 704, 1],
@@ -137,7 +137,7 @@ def val_data(
     print("Val dataset is:")
     pprint(ds.element_spec)
 
-    return lacss.train.TFDatasetAdapter(ds, steps=-1).get_dataset()
+    return TFDatasetAdapter(ds)
 
 
 @app.command()
@@ -154,8 +154,6 @@ def run_training(
     n_buckets: int = 4,
     v1_scaling: bool = False,
 ):
-    tf.random.set_seed(seed)
-
     logpath.mkdir(parents=True, exist_ok=True)
 
     logging.info(f"Logging to {logpath.resolve()}")
@@ -178,29 +176,28 @@ def run_training(
 
     logging.info(f"Model configuration loaded from {config}")
 
-    trainer = lacss.train.LacssTrainer(
+    trainer = LacssTrainer(
         model_cfg,
         seed=seed,
-        strategy=lacss.train.VMapped,
+        strategy=VMapped,
+        optimizer=optax.adamw(schedule),
     )
 
-    trainer.initialize(train_gen, optax.adamw(schedule))
+    # trainer.initialize(train_gen, optax.adamw(schedule))
 
     cp_mngr = orbax.checkpoint.CheckpointManager(
-        logpath,
-        trainer.get_checkpointer(),
+        logpath.absolute(),
     )
 
-    if len(cp_mngr.all_steps()) > 0:
-        trainer.restore_from_checkpoint(cp_mngr)
-
-    elif transfer is not None:
-        _, params = load_from_pretrained(transfer)
-        orig_params = unfreeze(trainer.params)
-        orig_params["principal"] = params
-        trainer.params = freeze(orig_params)
+    if transfer is not None:
+        _, transfer_params = load_from_pretrained(transfer)
+        params = trainer.get_init_params(train_gen)
+        params["principal"] = transfer_params
+        init_vars = dict(params = params)
 
         logging.info(f"Transfer model weights from {transfer}")
+    else:
+        init_vars = None
 
     print("Model configuration:")
     pprint(
@@ -214,9 +211,12 @@ def run_training(
         n_steps=n_steps,
         validation_interval=validation_interval,
         checkpoint_manager=cp_mngr,
+        init_vars=init_vars,
     )
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    logging.info(f"jax backend is: {jax.default_backend()}")
+
     app()

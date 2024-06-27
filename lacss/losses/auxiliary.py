@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from functools import partial
 
 import jax
@@ -5,8 +7,8 @@ import jax.numpy as jnp
 import optax
 
 from ..ops import sorbel_edges
-from ..train.loss import Loss
-from .detection import _binary_focal_crossentropy
+from .common import binary_focal_factor_loss
+from lacss.train.utils import unpack_x_y_sample_weight
 
 EPS = jnp.finfo("float32").eps
 
@@ -20,19 +22,33 @@ def _compute_edge(instance_output, instance_yc, instance_xc, height, width):
     patch_edges = jnp.sqrt(jnp.clip(patch_edges, 1e-8, 1.0))  # avoid GPU error
     # patch_edges = jnp.where(patch_edges > 0, jnp.sqrt(patch_edges), 0)
     combined_edges = jnp.zeros([height + padding * 2, width + padding * 2])
+    combined_mask = jnp.zeros([height + padding * 2, width + padding * 2], dtype=bool)
+
     combined_edges = combined_edges.at[
         instance_yc + padding, instance_xc + padding
     ].add(patch_edges)
+    combined_mask = combined_mask.at[instance_yc + padding, instance_xc + padding].set(
+        True
+    )
+
     combined_edges = combined_edges[
         padding : padding + height, padding : padding + width
     ]
-    combined_edges = jnp.tanh(combined_edges)
+    combined_mask = combined_mask[padding : padding + height, padding : padding + width]
+    combined_edges = jnp.where(
+        combined_mask,
+        jnp.tanh(combined_edges),
+        -1,
+    )
 
     return combined_edges
 
 
-def self_supervised_edge_loss(preds, inputs, **kwargs):
+def self_supervised_edge_loss(batch, prediction):
     """Cell border prediction consistency loss"""
+
+    preds = prediction
+    inputs, _, _ = unpack_x_y_sample_weight(batch)
 
     instance_output = preds["instance_output"]
     instance_yc = preds["instance_yc"]
@@ -43,18 +59,18 @@ def self_supervised_edge_loss(preds, inputs, **kwargs):
     )
     instance_edge_pred = jax.nn.sigmoid(preds["edge_pred"])
 
-    return optax.l2_loss(instance_edge_pred, instance_edge).mean()
+    return optax.l2_loss(instance_edge_pred, instance_edge).mean(
+        where=instance_edge >= 0
+    )
 
 
 def self_supervised_segmentation_loss(
-    preds,
-    inputs,
-    *,
-    offset_sigma=jnp.array([10.0]),
-    offset_scale=jnp.array([2.0]),
-    **kwargs,
+    batch, prediction, *, offset_sigma=jnp.array([10.0]), offset_scale=jnp.array([2.0])
 ):
     """Image segmentation consistenct loss for the collaboraor model"""
+
+    preds = prediction
+    inputs, _, _ = unpack_x_y_sample_weight(batch)
 
     height, width = inputs["image"].shape[:2]
     ps = preds["instance_yc"].shape[-1]
@@ -92,22 +108,31 @@ def self_supervised_segmentation_loss(
     fg_pred = jax.nn.sigmoid(preds["fg_pred"])
     fg_label = jax.lax.stop_gradient(jax.nn.sigmoid(_max_merge(preds)))
 
-    locs = jnp.floor(inputs["gt_locations"] + 0.5)
-    locs = locs.astype(int)
-    fg_label = fg_label.at[locs[:, 0], locs[:, 1]].set(1.0)
+    # locs = jnp.floor(inputs["gt_locations"] + 0.5)
+    # locs = locs.astype(int)
+    # fg_label = fg_label.at[locs[:, 0], locs[:, 1]].set(1.0)
 
     assert fg_pred.shape == fg_label.shape
 
-    # loss = 1.0 - fg_pred * jax.lax.stop_gradient(fg_label)
-    loss = (1.0 - fg_label) * fg_pred + fg_label * (1.0 - fg_pred)
-
+    # loss = (1.0 - fg_label) * fg_pred + fg_label * (1.0 - fg_pred)
+    # p_t = fg_label * fg_pred + (1.0 -fg_label) * (1.0 - fg_pred)
+    # loss = -jnp.log(jnp.clip(p_t, EPS, 1))
+    loss = binary_focal_factor_loss(fg_pred, fg_label, gamma=1)
     loss = loss.mean()
 
     return loss
 
 
-def aux_size_loss(preds, inputs, *, weight=0.01, **kwargs):
+def aux_size_loss(batch, prediction, *, weight=0.01):
     """Auxillary loss to prevent model collapse"""
+    preds = prediction
+    inputs, labels, _ = unpack_x_y_sample_weight(batch)
+
+    if labels is None:
+        labels = {}
+
+    if "gt_labels" in labels or "gt_masks" in labels:
+        return 0.0
 
     height, width = inputs["image"].shape[:2]
 
@@ -131,7 +156,9 @@ def aux_size_loss(preds, inputs, *, weight=0.01, **kwargs):
     return loss * weight
 
 
-def supervised_segmentation_loss(preds, labels, **kwargs):
+def supervised_segmentation_loss(batch, prediction):
+    preds = prediction
+    _, labels, _ = unpack_x_y_sample_weight(batch)
 
     if "gt_labels" in labels:
 
@@ -144,50 +171,36 @@ def supervised_segmentation_loss(preds, labels, **kwargs):
     return optax.sigmoid_binary_cross_entropy(preds["fg_pred"], mask).mean()
 
 
-class AuxEdgeLoss(Loss):
-    def call(
-        self,
-        inputs: dict,
-        preds: dict,
-        **kwargs,
-    ):
-        if not "training_locations" in preds:
-            return 0.0
+def collaborator_segm_loss(batch, prediction, *, sigma, pi):
+    preds = prediction
+    inputs, labels, _ = unpack_x_y_sample_weight(batch)
 
-        return self_supervised_edge_loss(preds, inputs)
+    if not "fg_pred" in preds:
+        return 0.0
 
+    if labels is None:
+        labels = {}
 
-class AuxSizeLoss(Loss):
-    def __init__(self, alpha=1e-2):
-        super().__init__()
-        self.a = alpha
-
-    def call(self, inputs, preds, **kwargs):
-
-        return aux_size_loss(preds, inputs, weight=self.a)
-
-
-class AuxSegLoss(Loss):
-    def __init__(self, offset_sigma=10.0, offset_scale=5.0, **kwargs):
-        super().__init__(**kwargs)
-        try:
-            offset_sigma[0]
-        except:
-            offset_sigma = (offset_sigma,)
-
-        try:
-            offset_scale[0]
-        except:
-            offset_scale = (offset_scale,)
-
-        self.offset_scale = jnp.array(offset_scale)
-        self.offset_sigma = jnp.array(offset_sigma)
-
-    def call(self, inputs, preds, **kwargs):
-
+    if "gt_image_mask" in labels or "gt_labels" in labels:
+        return supervised_segmentation_loss(batch, prediction)
+    else:
         return self_supervised_segmentation_loss(
-            preds,
-            inputs,
-            offset_scale=self.offset_scale,
-            offset_sigma=self.offset_sigma,
+            batch, prediction, offset_sigma=sigma, offset_scale=pi
         )
+
+
+def collaborator_border_loss(batch, prediction):
+    preds = prediction
+    _, labels, _ = unpack_x_y_sample_weight(batch)
+
+    if not "edge_pred" in preds:
+        return 0.0
+
+    if labels is None:
+        labels = {}
+
+    if "gt_labels" in labels or "gt_masks" in labels:
+        return 0.0
+
+    else:
+        return self_supervised_edge_loss(batch, prediction)

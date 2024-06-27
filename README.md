@@ -4,15 +4,14 @@ _LACSS is a deep-learning model for single-cell segmentation from microscopy ima
 
 References: 
 
-- https://www.nature.com/articles/s42003-023-04608-5
-- https://arxiv.org/abs/2304.10671
+- [IEEE TMI doi:10.1109/TMI.2023.3312988](https://ieeexplore.ieee.org/document/10243149)
+- [Communications Biology 6,232 (2023)](https://www.nature.com/articles/s42003-023-04608-5)
 
 ### Installation
 ```
-pip install --upgrade pip
-pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 pip install lacss
 ```
+For more details, see [documentation](https://jiyuuchc.github.io/lacss/install/)
 
 ### Why LACSS?
 LACSS is designed to utilize point labels for model training. You have three options:

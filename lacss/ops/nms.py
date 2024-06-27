@@ -3,8 +3,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from lacss.types import *
-
+from ..typing import *
 from .boxes import box_iou_similarity
 from .locations import distance_similarity
 
@@ -160,7 +159,7 @@ def sorted_non_max_suppression(
     threshold: float = 0.5,
     min_score: float = 0,
     return_selection: bool = False,
-) -> Sequence[Array]:
+) -> tuple[Array]:
     """non-maximum suppression for either bboxes or points.
 
     Assumption:

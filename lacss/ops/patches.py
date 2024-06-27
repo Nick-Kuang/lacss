@@ -5,32 +5,34 @@
 from __future__ import annotations
 
 from functools import partial
+from typing import Optional, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from lacss.types import *
-
+from ..typing import *
 from .boxes import box_iou_similarity
 from .image import sub_pixel_samples
+
+Shape = Sequence[int]
 
 
 def gather_patches(
     features: ArrayLike, locations: ArrayLike, patch_size: int
-) -> Tuple[Array, Array, Array, Array]:
-    """extract feature patches according to a list of locations
+) -> tuple[Array, Array, Array, Array]:
+    # """extract feature patches according to a list of locations
 
-    Args:
-        features: [H,W,C] standard 2D feature map
-        locations: [N, 2] float32, scaled 0..1
-        patch_size: int
+    # Args:
+    #     features: [H,W,C] standard 2D feature map
+    #     locations: [N, 2] float32, scaled 0..1
+    #     patch_size: int
 
-    Returns:
-        patches: [N, patch_size, patch_size, C]
-        y0: [N]: y0 coordinates of patches
-        x0: [N]: x0 coordinates of patches
-    """
+    # Returns:
+    #     patches: [N, patch_size, patch_size, C]
+    #     y0: [N]: y0 coordinates of patches
+    #     x0: [N]: x0 coordinates of patches
+    # """
     height, width, _ = features.shape
 
     locations *= jnp.array([height, width])
@@ -71,9 +73,7 @@ def _get_patch_data(pred):
     return patches, yc, xc
 
 
-def bboxes_of_patches(
-    pred: Union[Sequence, DataDict], threshold: float = 0.5
-) -> jnp.ndarray:
+def bboxes_of_patches(pred: Sequence | DataDict, threshold: float = 0.5) -> jnp.ndarray:
     """Compute the instance bboxes from model predictions
 
     Args:
@@ -107,79 +107,79 @@ def bboxes_of_patches(
     return bboxes
 
 
-def indices_of_patches(
-    pred: Union[Sequence, DataDict],
-    input_size: Tuple[int, int] = None,
-    threshold: float = 0.5,
-) -> Array:
-    """Compute yx coodinates of all segmented instances
+# def indices_of_patches(
+#     pred: Sequence | DataDict,
+#     input_size: tuple[int, int] = None,
+#     threshold: float = 0.5,
+# ) -> Array:
+#     """Compute yx coodinates of all segmented instances
 
-    Args:
-        pred: A model prediction dictionary
-        threshold: float
+#     Args:
+#         pred: A model prediction dictionary
+#         threshold: float
 
-    Returns:
-        [N, 3] array. The first two columns are y-x coordinates. The third
-            column is a index value for different instances.
-    """
-    patches, yy, xx = _get_patch_data(pred)
+#     Returns:
+#         [N, 3] array. The first two columns are y-x coordinates. The third
+#             column is a index value for different instances.
+#     """
+#     patches, yy, xx = _get_patch_data(pred)
 
-    indices = patches >= threshold
-    yy = yy[indices]
-    xx = xx[indices]
-    rowids = jnp.argwhere(indices)[:, 0]
+#     indices = patches >= threshold
+#     yy = yy[indices]
+#     xx = xx[indices]
+#     rowids = jnp.argwhere(indices)[:, 0]
 
-    if input_size is not None:
-        height, width = input_size
-        valid_coords = ((yy >= 0) & (yy < height)) & ((xx >= 0) & (xx < width))
-        yy = yy[valid_coords]
-        xx = xx[valid_coords]
-        rowids = rowids[valid_coords]
+#     if input_size is not None:
+#         height, width = input_size
+#         valid_coords = ((yy >= 0) & (yy < height)) & ((xx >= 0) & (xx < width))
+#         yy = yy[valid_coords]
+#         xx = xx[valid_coords]
+#         rowids = rowids[valid_coords]
 
-    return jnp.stack([yy, xx, rowids], axis=-1)
+#     return jnp.stack([yy, xx, rowids], axis=-1)
 
 
-def iou_patches_and_labels(
-    pred: DataDict, labels: ArrayLike, BLOCK_SIZE: int = 128, threshold: float = 0.5
-) -> Array:
-    """Compute iou between prediction and ground truth label.
+# def iou_patches_and_labels(
+#     pred: DataDict, labels: ArrayLike, BLOCK_SIZE: int = 128, threshold: float = 0.5
+# ) -> Array:
+#     """Compute iou between prediction and ground truth label.
 
-    Args:
-        pred: A model prediction dictionary
-        labels: image label. bg_label = 0
-        threshold: for segmentation. default is 0.5
+#     Args:
+#         pred: A model prediction dictionary
+#         labels: image label. bg_label = 0
+#         threshold: for segmentation. default is 0.5
 
-    Returns:
-        [n, m] array of iou values.
-    """
-    patches, yc, xc = _get_patch_data(pred)
-    patches = patches >= threshold
-    pred_areas = jnp.count_nonzero(patches, axis=(-1, -2))
-    labels = labels.astype(int)
+#     Returns:
+#         [n, m] array of iou values.
+#     """
+#     patches, yc, xc = _get_patch_data(pred)
+#     patches = patches >= threshold
+#     pred_areas = jnp.count_nonzero(patches, axis=(-1, -2))
+#     labels = labels.astype(int)
 
-    pads = yc.shape[-1] // 2
-    padded_labels = jnp.pad(labels, pads, constant_values=0)
-    gt_patches = padded_labels[yc + pads, xc + pads]
+#     pads = yc.shape[-1] // 2
+#     padded_labels = jnp.pad(labels, pads, constant_values=0)
+#     gt_patches = padded_labels[yc + pads, xc + pads]
 
-    max_indices = ((labels.max() - 1) // BLOCK_SIZE + 1) * BLOCK_SIZE
-    all_gt_areas = jnp.count_nonzero(
-        labels[:, :, None] == jnp.arange(max_indices) + 1, axis=(0, 1)
-    )
+#     max_indices = ((labels.max() - 1) // BLOCK_SIZE + 1) * BLOCK_SIZE
+#     all_gt_areas = jnp.count_nonzero(
+#         labels[:, :, None] == jnp.arange(max_indices) + 1, axis=(0, 1)
+#     )
 
-    ious = []
-    # FIXME change to scan
-    for k in range(1, labels.max() + 1, BLOCK_SIZE):
-        gt_p = gt_patches == jnp.arange(k, k + BLOCK_SIZE).reshape(
-            -1, 1, 1, 1
-        )  # [B, N, s, s]
-        gt_areas = all_gt_areas[k - 1 : k + BLOCK_SIZE - 1]
-        intersect = jnp.count_nonzero(gt_p & patches, axis=(-1, -2))  # [B, N]
-        ious.append(intersect / (pred_areas + gt_areas[:, None] - intersect + 1.0e-8))
+#     ious = []
+#     # FIXME change to scan
+#     for k in range(1, labels.max() + 1, BLOCK_SIZE):
+#         gt_p = gt_patches == jnp.arange(k, k + BLOCK_SIZE).reshape(
+#             -1, 1, 1, 1
+#         )  # [B, N, s, s]
+#         gt_areas = all_gt_areas[k - 1 : k + BLOCK_SIZE - 1]
+#         intersect = jnp.count_nonzero(gt_p & patches, axis=(-1, -2))  # [B, N]
+#         ious.append(intersect / (pred_areas + gt_areas[:, None] - intersect + 1.0e-8))
 
-    ious = jnp.concatenate(ious, axis=0).transpose()  # [N, B * b]
-    ious = ious[:, : labels.max()]  # this breaks JIT
+#     ious = jnp.concatenate(ious, axis=0).transpose()  # [N, B * b]
+#     ious = ious[:, : labels.max()]  # this breaks JIT
 
-    return ious
+#     return ious
 
 
 def patches_to_segmentations(
@@ -214,7 +214,6 @@ def patches_to_label(
     mask: Optional[ArrayLike] = None,
     score_threshold: float = 0.5,
     threshold: float = 0.5,
-    min_cell_area: int = 0,
 ) -> Array:
     """convert patch output to the image label
 
@@ -224,107 +223,108 @@ def patches_to_label(
         mask: boolean indicators masking out unwanted instances. Default is None (all cells)
         score_threshold: otional, min_score to be included. Default is .5.
         threshold: segmentation threshold.  Default .5
-        min_cell_area: optional minimal cell area to be plotted, default 0.
 
     Returns:
         label: [height, width]
     """
     label = jnp.zeros(input_size)
     pr = pred["instance_output"] > threshold
-    n_patches, patch_size, _ = pr.shape
 
     if mask is None:
-        mask = jnp.ones([n_patches], dtype=bool)
-    mask &= pred["instance_mask"].squeeze(axis=(1, 2))
-    if score_threshold > 0 and not "training_locations" in pred:
-        mask &= pred["pred_scores"] >= score_threshold
-    mask &= jnp.count_nonzero(pr, axis=(1, 2)) > min_cell_area
+        mask = pred["instance_mask"].squeeze(axis=(1, 2))
+    else:
+        mask &= pred["instance_mask"].squeeze(axis=(1, 2))
 
-    pr = (pr > threshold).astype(int) * jnp.arange(1, pr.shape[0] + 1)[:, None, None]
-    pr = jnp.where(mask[:, None, None], pr, 0)
-    pr = jnp.where(pr == 0, 0, pr.max() + 1 - pr)
+    if score_threshold > 0:
+        mask &= pred["pred_scores"] >= score_threshold
+
+    idx = jnp.cumsum(mask) * mask
+    idx = jnp.where(mask, idx.max() + 1 - idx, 0)
+    
+    pr = (pr > threshold).astype(int) * idx[:, None, None]
 
     yc = pred["instance_yc"]
     xc = pred["instance_xc"]
 
     label = label.at[yc, xc].max(pr)
+    label = jnp.where(label, label.max() + 1 - label, 0)
 
     return label
 
 
-def ious_of_patches_from_same_image(pred: DataDict, threshold: float = 0.5) -> Array:
-    """Compute IOUs among instances from the same image. Most likely used for nms.
+# def ious_of_patches_from_same_image(pred: DataDict, threshold: float = 0.5) -> Array:
+#     """Compute IOUs among instances from the same image. Most likely used for nms.
 
-    Args:
-        pred: A model prediction dictionary
-        threshold: Segmentation threshold. Default is 0.5.
+#     Args:
+#         pred: A model prediction dictionary
+#         threshold: Segmentation threshold. Default is 0.5.
 
-    Returns:
-        ious: IOUs as an upper triagle matrix.
-    """
+#     Returns:
+#         ious: IOUs as an upper triagle matrix.
+#     """
 
-    bboxes = bboxes_of_patches(pred)
-    box_ious = box_iou_similarity(bboxes, bboxes)
-    box_ious = np.triu(box_ious, 1)
-    # n_detections = jnp.count_nonzero(pred['instance_mask'])
-    # box_ious = box_ious[:n_detections, :n_detections]
+#     bboxes = bboxes_of_patches(pred)
+#     box_ious = box_iou_similarity(bboxes, bboxes)
+#     box_ious = np.triu(box_ious, 1)
+#     # n_detections = jnp.count_nonzero(pred['instance_mask'])
+#     # box_ious = box_ious[:n_detections, :n_detections]
 
-    cy, cx = np.where(box_ious > 0)
-    pad_size = pred["instance_output"].shape[-1]
+#     cy, cx = np.where(box_ious > 0)
+#     pad_size = pred["instance_output"].shape[-1]
 
-    patches = np.asarray(pred["instance_output"]) >= threshold
-    patches_y = patches[cy]
-    patches_x = patches[cx]
-    plt_to = np.zeros([len(cy), pad_size * 3, pad_size * 3], dtype=bool)
-    dy = (
-        np.asarray(pred["instance_yc"])[cy, 0, 0]
-        - np.asarray(pred["instance_yc"])[cx, 0, 0]
-        + pad_size
-    )
-    dx = (
-        np.asarray(pred["instance_xc"])[cy, 0, 0]
-        - np.asarray(pred["instance_xc"])[cx, 0, 0]
-        + pad_size
-    )
+#     patches = np.asarray(pred["instance_output"]) >= threshold
+#     patches_y = patches[cy]
+#     patches_x = patches[cx]
+#     plt_to = np.zeros([len(cy), pad_size * 3, pad_size * 3], dtype=bool)
+#     dy = (
+#         np.asarray(pred["instance_yc"])[cy, 0, 0]
+#         - np.asarray(pred["instance_yc"])[cx, 0, 0]
+#         + pad_size
+#     )
+#     dx = (
+#         np.asarray(pred["instance_xc"])[cy, 0, 0]
+#         - np.asarray(pred["instance_xc"])[cx, 0, 0]
+#         + pad_size
+#     )
 
-    for k in range(len(cy)):
-        plt_to[k, dy[k] : dy[k] + pad_size, dx[k] : dx[k] + pad_size] = patches_y[k]
-    plt_to = plt_to[:, pad_size : pad_size * 2, pad_size : pad_size * 2]
-    unions = np.count_nonzero(plt_to & patches_x, axis=(1, 2))
+#     for k in range(len(cy)):
+#         plt_to[k, dy[k] : dy[k] + pad_size, dx[k] : dx[k] + pad_size] = patches_y[k]
+#     plt_to = plt_to[:, pad_size : pad_size * 2, pad_size : pad_size * 2]
+#     unions = np.count_nonzero(plt_to & patches_x, axis=(1, 2))
 
-    areas_y = np.count_nonzero(patches_y, axis=(1, 2))
-    areas_x = np.count_nonzero(patches_x, axis=(1, 2))
+#     areas_y = np.count_nonzero(patches_y, axis=(1, 2))
+#     areas_x = np.count_nonzero(patches_x, axis=(1, 2))
 
-    ious = unions / (areas_x + areas_y - unions + 1e-8)
+#     ious = unions / (areas_x + areas_y - unions + 1e-8)
 
-    mask_ious = box_ious
-    mask_ious[(cy, cx)] = ious
+#     mask_ious = box_ious
+#     mask_ious[(cy, cx)] = ious
 
-    return mask_ious
+#     return mask_ious
 
 
-def non_max_suppress_predictions(pred: DataDict, iou_threshold: float = 0.6) -> Array:
-    """Perform nms on the model prediction based on mask IOU
+# def non_max_suppress_predictions(pred: DataDict, iou_threshold: float = 0.6) -> Array:
+#     """Perform nms on the model prediction based on mask IOU
 
-    Args:
-        pred: A model prediction dictionary
-        ious_threshold: default 0.6
+#     Args:
+#         pred: A model prediction dictionary
+#         ious_threshold: default 0.6
 
-    Returns:
-        mask: boolean mask of cells not supressed
-    """
+#     Returns:
+#         mask: boolean mask of cells not supressed
+#     """
 
-    ious = ious_of_patches_from_same_image(pred)
-    mask = ious > iou_threshold
+#     ious = ious_of_patches_from_same_image(pred)
+#     mask = ious > iou_threshold
 
-    cnt = 0
-    while np.count_nonzero(mask) != cnt:
-        cnt = jnp.count_nonzero(mask)
-        can_suppress_others = ~mask.any(axis=0)
-        suppressed = (mask & can_suppress_others[:, None]).any(axis=0)
-        mask = mask & ~suppressed[:, None]
+#     cnt = 0
+#     while np.count_nonzero(mask) != cnt:
+#         cnt = jnp.count_nonzero(mask)
+#         can_suppress_others = ~mask.any(axis=0)
+#         suppressed = (mask & can_suppress_others[:, None]).any(axis=0)
+#         mask = mask & ~suppressed[:, None]
 
-    return ~mask.any(axis=0)
+#     return ~mask.any(axis=0)
 
 
 _sampling_op = jax.vmap(partial(sub_pixel_samples, edge_indexing=True))
@@ -333,7 +333,7 @@ _sampling_op = jax.vmap(partial(sub_pixel_samples, edge_indexing=True))
 def rescale_patches(
     pred: DataDict,
     scale: float,
-) -> Tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Rescale/resize instance outputs in a sub-pixel accurate way.
     If the input image was rescaled, this function take care of rescaling the predictions
     to the orginal coodinates.

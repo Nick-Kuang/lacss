@@ -1,29 +1,23 @@
 #!/usr/bin/env python
 
-import os
-
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
-import tensorflow as tf
-
-tf.config.set_visible_devices([], "GPU")
-
 import dataclasses
 import json
 import logging
 from pathlib import Path
 from pprint import pprint
+from typing import Iterator
 
+import jax
 import optax
 import orbax.checkpoint
 import typer
 from data import augment, get_cell_type_and_scaling, remove_redundant
 from flax.core.frozen_dict import freeze, unfreeze
 
-import lacss.data
-import lacss.train
-from lacss.deploy import load_from_pretrained
-from lacss.types import *
+from lacss.data import dataset_from_coco_annotations, resize
+from lacss.train import LacssTrainer, TFDatasetAdapter
+from lacss.typing import *
+from lacss.utils import load_from_pretrained
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -34,6 +28,8 @@ def train_data(
     target_size=[544, 544],
     v1_scaling=False,
 ) -> Iterator:
+    import tensorflow as tf
+
     def _train_parser(inputs):
         ver = 1 if v1_scaling else 2
         cell_type, default_scale = tf.py_function(
@@ -60,7 +56,7 @@ def train_data(
         )
 
     ds = (
-        lacss.data.dataset_from_coco_annotations(
+        dataset_from_coco_annotations(
             datapath / "annotations" / "LIVECell" / "livecell_coco_train.json",
             datapath / "images" / "livecell_train_val_images",
             [520, 704, 1],
@@ -76,10 +72,12 @@ def train_data(
     print("Train dataset is: ")
     pprint(ds.element_spec)
 
-    return lacss.train.TFDatasetAdapter(ds, steps=-1).get_dataset()
+    return TFDatasetAdapter(ds)
 
 
 def val_data(datapath: Path, *, v1_scaling: bool = False) -> Iterator:
+    import tensorflow as tf
+
     def _val_parser(inputs):
         del inputs["masks"]
 
@@ -95,7 +93,7 @@ def val_data(datapath: Path, *, v1_scaling: bool = False) -> Iterator:
         h, w, _ = inputs["image"].shape
         h = tf.round(h * default_scale)
         w = tf.round(w * default_scale)
-        inputs = lacss.data.resize(inputs, target_size=[h, w])
+        inputs = resize(inputs, target_size=[h, w])
 
         return dict(image=inputs["image"], cls_id=cell_type,), dict(
             gt_locations=inputs["centroids"],
@@ -103,7 +101,7 @@ def val_data(datapath: Path, *, v1_scaling: bool = False) -> Iterator:
         )
 
     ds = (
-        lacss.data.dataset_from_coco_annotations(
+        dataset_from_coco_annotations(
             datapath / "annotations" / "LIVECell" / "livecell_coco_val.json",
             datapath / "images" / "livecell_train_val_images",
             [520, 704, 1],
@@ -117,7 +115,7 @@ def val_data(datapath: Path, *, v1_scaling: bool = False) -> Iterator:
     print("Val dataset is:")
     pprint(ds.element_spec)
 
-    return lacss.train.TFDatasetAdapter(ds, steps=-1).get_dataset()
+    return TFDatasetAdapter(ds)
 
 
 @app.command()
@@ -136,8 +134,6 @@ def run_training(
     size_loss: float = 0.01,
     v1_scaling: bool = False,
 ):
-    tf.random.set_seed(seed)
-
     logpath.mkdir(parents=True, exist_ok=True)
 
     logging.info(f"Logging to {logpath}")
@@ -150,29 +146,28 @@ def run_training(
 
     logging.info(f"Model configuration loaded from {config}")
 
-    trainer = lacss.train.LacssTrainer(
+    trainer = LacssTrainer(
         model_cfg,
         dict(n_cls=8),
         seed=seed,
+        optimizer=optax.adamw(lr),
     )
 
-    trainer.initialize(train_gen, optax.adamw(lr))
+    # trainer.initialize(train_gen, optax.adamw(lr))
 
     cp_mngr = orbax.checkpoint.CheckpointManager(
-        logpath,
-        trainer.get_checkpointer(),
+        logpath.absolute(),
     )
 
-    if len(cp_mngr.all_steps()) > 0:
-        trainer.restore_from_checkpoint(cp_mngr)
-
-    elif transfer is not None:
+    if transfer is not None:
         _, transfer_params = load_from_pretrained(transfer)
-        params = unfreeze(trainer.params)
+        params = trainer.get_init_params(train_gen)
         params["principal"] = transfer_params
-        trainer.params = freeze(params)
+        init_vars = dict(params = params)
 
         logging.info(f"Transfer model configuration and weights from {transfer}")
+    else:
+        init_vars = None
 
     print("Model configuration:")
     pprint(
@@ -189,11 +184,13 @@ def run_training(
         checkpoint_manager=cp_mngr,
         sigma=offset_sigma,
         pi=offset_scale,
+        init_vars=init_vars,
     )
 
 
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
+    logging.info(f"jax backend is: {jax.default_backend()}")
 
     app()

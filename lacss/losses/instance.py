@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from functools import partial
 
 import jax
@@ -5,33 +7,13 @@ import jax.numpy as jnp
 import optax
 
 from ..ops import sub_pixel_samples
-from ..train.loss import Loss
+from .common import binary_focal_factor_loss, mean_over_boolean_mask
+from lacss.train.utils import unpack_x_y_sample_weight
 
-EPS = jnp.finfo("float32").eps
-
-
-def _mean_over_boolean_mask(loss, mask):
-    mask = mask.reshape(mask.shape[0], 1)
-    n_instances = jnp.count_nonzero(mask) + EPS
-
-    loss = loss.reshape(loss.shape[0], -1)
-    loss = loss.mean(axis=1, keepdims=True).sum(where=mask)
-    loss /= n_instances
-
-    return loss
-
-
-def supervised_instance_loss(preds, labels, **kwargs):
-    """LACSS instance loss, supervised with segmentation label
-
-    Args:
-        preds: Model predictions
-        labels: Label dictionary. Two types of segmentation labels are accepted.
-            If ```labels["gt_labels"]``` is provided, its value is treated as pixel
-            labels of the image. Otherwisde, one much supply both ```labels["gt_bboxes"]```
-            and ```labels["gt_masks"]```. The gt_masks is a 3D array representing all
-            segmentation resized to a fixed dimension.
-    """
+def supervised_instance_loss(batch, prediction):
+    """LACSS instance loss, supervised with segmentation label"""
+    preds = prediction
+    _, labels, _ = unpack_x_y_sample_weight(batch)
 
     instance_mask = preds["instance_mask"]
     instance_logit = preds["instance_logit"]
@@ -76,17 +58,13 @@ def supervised_instance_loss(preds, labels, **kwargs):
 
     loss = optax.sigmoid_binary_cross_entropy(instance_logit, gt_patches)
 
-    return _mean_over_boolean_mask(loss, instance_mask)
+    return mean_over_boolean_mask(loss, instance_mask)
 
 
-def self_supervised_instance_loss(preds, *, soft_label: bool = True, **kwargs):
-    """Unsupervised instance loss
-
-    Args:
-        preds: Model prediction dict.
-        soft_label: If False, it convertes image mask prediction to hard label
-            (ie. 0 or 1), before computing loss.
-    """
+def self_supervised_instance_loss(batch, prediction, *, soft_label: bool = True):
+    """Unsupervised instance loss"""
+    preds = prediction
+    _, labels, _ = unpack_x_y_sample_weight(batch)
 
     instance_mask = preds["instance_mask"]
     instances = preds["instance_output"]
@@ -105,19 +83,19 @@ def self_supervised_instance_loss(preds, *, soft_label: bool = True, **kwargs):
     if soft_label:
         seg_patch = seg[yc, xc]
 
-        loss = (1.0 - seg_patch) * instances + seg_patch * (1.0 - instances)
+        loss = (1 - seg_patch) * instances + seg_patch * (1 - instances)
 
         instance_sum = jnp.zeros_like(seg)
         instance_sum = instance_sum.at[yc, xc].add(instances)
         instance_sum_i = instance_sum[yc, xc] - instances
 
-        loss = loss + instances * instance_sum_i
+        loss += instances * instance_sum_i
 
     else:
         seg = (seg > 0.5).astype(instances.dtype)
         seg_patch = seg[yc, xc]
 
-        loss = (1.0 - seg_patch) * instances + seg_patch * (1.0 - instances)
+        loss = (1 - seg_patch) * instances + seg_patch * (1 - instances)
 
         log_yi_sum = jnp.zeros_like(seg)
         log_yi = -jax.nn.log_sigmoid(-instance_logit)
@@ -126,13 +104,13 @@ def self_supervised_instance_loss(preds, *, soft_label: bool = True, **kwargs):
 
         loss = loss + (instances * log_yi)
 
-    return _mean_over_boolean_mask(loss, instance_mask)
+    return mean_over_boolean_mask(loss, instance_mask)
 
 
-def weakly_supervised_instance_loss(
-    preds, labels, inputs, *, ignore_mask: bool = False, **kwargs
-):
+def weakly_supervised_instance_loss(batch, prediction, *, ignore_mask: bool = False):
     """Instance loss supervised by image mask instead of instance masks"""
+    preds = prediction
+    inputs, labels, _ = unpack_x_y_sample_weight(batch)
 
     instance_mask = preds["instance_mask"]
     instances = preds["instance_output"]
@@ -166,29 +144,21 @@ def weakly_supervised_instance_loss(
 
     loss = loss + (instances * log_yi)
 
-    return _mean_over_boolean_mask(loss, instance_mask)
+    return mean_over_boolean_mask(loss, instance_mask)
 
 
-class SupervisedInstanceLoss(Loss):
-    def call(self, preds: dict, labels: dict, **kwargs):
-        return supervised_instance_loss(preds, labels)
+def segmentation_loss(batch, prediction, *, pretraining=False):
+    preds = prediction
+    inputs, labels, _ = unpack_x_y_sample_weight(batch)
 
+    if labels is None:
+        labels = {}
 
-class SelfSupervisedInstanceLoss(Loss):
-    def __init__(self, soft_label: bool = True, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.soft_label = soft_label
-
-    def call(self, preds: dict, **kwargs):
-        return self_supervised_instance_loss(preds, soft_label=self.soft_label)
-
-
-class WeaklySupervisedInstanceLoss(Loss):
-    def __init__(self, ignore_mask: bool = False, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ignore_mask = ignore_mask
-
-    def call(self, *, preds, labels, inputs):
-        return weakly_supervised_instance_loss(
-            preds, labels, inputs, ignore_mask=self.ignore_mask
+    if "gt_labels" in labels or "gt_masks" in labels:  # supervised
+        return supervised_instance_loss(batch, prediction)
+    elif "gt_image_mask" in labels:  # supervised by point + imagemask
+        return weakly_supervised_instance_loss(batch, prediction)
+    else:  # point-supervised
+        return self_supervised_instance_loss(
+            batch, prediction, soft_label=not pretraining
         )

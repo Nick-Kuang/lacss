@@ -2,13 +2,15 @@
 metrics classes for computing coco-style AP metrics.
 """
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from ..ops import *
-from ..train.metric import Metric
-from ..utils import _get_name
+from ..typing import *
+from lacss.train.utils import unpack_x_y_sample_weight
 
 """
 BE CAREFUL making changes here. Very easy to make a mistake and resulting mismatch with
@@ -49,8 +51,8 @@ def _unique_location_matching(similarity_matrix, threshold):
 
 def np_compute_ap(similarity_matrix, thresholds):
     # avoid edge cases
-    _, k = similarity_matrix.shape
-    if k == 0:
+    n, k = similarity_matrix.shape
+    if k == 0 or n == 0:
         return np.zeros([len(thresholds)], np.float32)
 
     apmks = []
@@ -62,7 +64,7 @@ def np_compute_ap(similarity_matrix, thresholds):
     return np.array(apmks, np.float32)
 
 
-class AP(Metric):
+class AP:
     """compute AP based on similarity_matrix and score.
     Usage:
       m = MeanAP([threshold_1, threshold_2,...])
@@ -74,9 +76,7 @@ class AP(Metric):
     def __init__(self, thresholds=[0.5], coco_style=False, name=None):
         self.thresholds = thresholds
         self.coco_style = coco_style
-        if name is None:
-            self.name = _get_name(self)
-        else:
+        if name is not None:
             self.name = name
         self.reset()
 
@@ -84,7 +84,10 @@ class AP(Metric):
         self.cell_counts += sm.shape[1]
         self.scores.append(scores)
         for th, indicators in zip(self.thresholds, self.indicator_list):
-            _, ind = _unique_location_matching(sm, th)
+            if sm.shape[1] > 0:
+                _, ind = _unique_location_matching(sm, th)
+            else:
+                ind = np.zeros(sm.shape[0], dtype=np.int32)
             indicators.append(ind)
 
         self._result = None
@@ -128,7 +131,14 @@ class LoiAP(AP):
     def __init__(self, thresholds=[0.5], **kwargs):
         super().__init__([1 / th / th for th in thresholds], **kwargs)
 
-    def update(self, preds, gt_locations, **kwargs):
+    def update(self, batch, prediction):
+        preds = prediction
+        inputs, labels, _ = unpack_x_y_sample_weight(batch)
+        if "gt_locations" in inputs:
+            gt_locations = inputs["gt_locations"]
+        else:
+            gt_locations = labels["gt_locations"]
+
         score = np.asarray(preds["pred_scores"])
         pred = np.asarray(preds["pred_locations"])
         gt = np.asarray(gt_locations)
@@ -137,7 +147,7 @@ class LoiAP(AP):
         col_mask = (gt >= 0).all(axis=-1)
         dist2 = ((pred[:, None, :] - gt[:, :]) ** 2).sum(axis=-1)
 
-        dist2 = 1.0 / dist2
+        dist2 = 1.0 / (dist2 + 1e-8)
         dist2 = dist2[row_mask][:, col_mask]
         score = np.asarray(score)[row_mask]
 
@@ -154,7 +164,11 @@ class BoxAP(AP):
       m.compute()
     """
 
-    def update(self, preds, gt_bboxes, **kwargs):
+    def update(self, batch, prediction):
+        preds = prediction
+        _, labels, _ = unpack_x_y_sample_weight(batch)
+        gt_bboxes = labels["gt_bboxes"]
+
         pred_bboxes = np.asarray(bboxes_of_patches(preds))
         gt_bboxes = np.asarray(gt_bboxes)
         iou = box_iou_similarity(pred_bboxes, gt_bboxes)

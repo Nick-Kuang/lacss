@@ -7,7 +7,7 @@ from jax.scipy.signal import convolve
 
 jnp = jax.numpy
 
-from lacss.types import *
+from ..typing import *
 
 
 def sorbel_edges(image: ArrayLike) -> Array:
@@ -81,7 +81,7 @@ def sub_pixel_samples(
         img: Array of shape [D1,D2,..,Dk, ...]
         locs: Array of shape [d1,d2,..,dn, k]
         out_of_bound_value: optional float constant, defualt 0.
-        edge_indexing: if True, the index for the first value in img is 0.5, otherwise 0. Default is False
+        edge_indexing: if True, the index for the top/left pixel is 0.5, otherwise 0. Default is False
 
     Returns:
         values: [d1,d2,..,dn, ...], float
@@ -107,14 +107,19 @@ def sub_pixel_samples(
 
 
 def sub_pixel_crop_and_resize(
-    img: ArrayLike, bbox: ArrayLike, output_shape: Shape, out_of_bound_value: float = 0
+    img: ArrayLike,
+    bbox: ArrayLike,
+    output_shape: tuple[int],
+    out_of_bound_value: float = 0,
 ) -> Array:
-    """Retrieve image values of a bbox resize output. Used for ROI-Align
+    """Retrieve image values of a bbox. Resize output to output_shape. Used for ROI-Align.
+
     Args:
         img: Array of shape [H, W, ...]
         bbox: [y0, x0, y1, x1]
         output_shape: [h, w]
         out_of_bound_value: optional float constant, defualt 0.
+
     Returns:
         values: [h, w, ...], float
     """
