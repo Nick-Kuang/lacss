@@ -13,7 +13,11 @@ from lacss.ops import patches_to_label, sorted_non_max_suppression
 
 from .predict import Predictor
 
-from cellpose import models,io
+import os
+from os.path import join
+import tempfile
+import pickle
+
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -78,10 +82,9 @@ def main(modelpath: Path):
     modelpath = str(modelpath)
     
 
-    print(f'cellpose_server: Trying to load cellpose model...')
-    model = models.Cellpose(gpu = True, model_type="cyto")
+    print(f'cellpose_server: Initializing...')
+    
 
-    print(f"cellpose_server: loaded model defualt Cyto Model")
 
 
     while True:
@@ -93,9 +96,12 @@ def main(modelpath: Path):
 
         print(f"received image {img.shape}", file=sys.stderr)
 
-        masks, flows, _, __ = model.eval(
-            img, 
-        )
+        with tempfile.TemporaryDirectory as tempdir:
+        
+            os.system("conda run -n cellpose python cellpose_model --image img --dir tempdir")
+
+            f = open(join(tempdir,'storage.pkl'))
+            masks, flows, __, ___ = pickle.load(f)
 
 
         label = masks.astype("int")
