@@ -1,5 +1,6 @@
 import dataclasses
 import re
+from collections import deque
 from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
 import jax
@@ -62,7 +63,9 @@ def _lower_snake_case(s: str) -> str:
 
 
 def _get_name(obj) -> str:
-    if hasattr(obj, "name") and obj.name:
+    if isinstance(obj, str):
+        return obj.split("/")[-1]
+    elif hasattr(obj, "name") and obj.name:
         return obj.name
     elif hasattr(obj, "func") and obj.func.__name__:
         return _lower_snake_case(obj.func.__name__)
@@ -78,6 +81,42 @@ def list_to_tuple(maybe_list):
     if isinstance(maybe_list, list):
         return tuple(maybe_list)
     return maybe_list
+
+
+def pack_x_y_sample_weight(x, y=None, sample_weight=None):
+    """Packs user-provided data into a tuple."""
+    if y is None:
+        return (x,)
+    elif sample_weight is None:
+        return (x, y)
+    else:
+        return (x, y, sample_weight)
+
+
+def unpack_x_y_sample_weight(data):
+    """Unpacks user-provided data tuple."""
+    if not isinstance(data, tuple):
+        return (data, None, None)
+    elif len(data) == 1:
+        return (data[0], None, None)
+    elif len(data) == 2:
+        return (data[0], data[1], None)
+    elif len(data) == 3:
+        return (data[0], data[1], data[2])
+
+    raise ValueError("Data not understood.")
+
+
+def unpack_prediction_and_state(pred, mutable=None):
+    if mutable is not None:
+        if mutable:
+            return pred[0], pred[1]
+        else:
+            return pred, {}
+    if isinstance(pred, tuple):
+        return pred[0], pred[1]
+    else:
+        return pred[0], {}
 
 
 class Inputs(struct.PyTreeNode):
@@ -117,27 +156,21 @@ try:
         def __init__(
             self,
             x: DataLoader,
-            steps: int = -1,
         ):
-            self.steps = steps
             self._dataset = x
-            self.current_step = 0
 
         def get_dataset(self):
             def parse_dataloader_gen():
-                self.current_step = 0
                 for batch in iter(self._dataset):
-                    self.current_step += 1
                     batch = jax.tree_util.tree_map(
                         lambda x: x.cpu().numpy(), list_to_tuple(batch)
                     )
                     yield batch
 
-            return parse_dataloader_gen
+            return parse_dataloader_gen()
 
         def __iter__(self):
-            g = self.get_dataset()
-            return g()
+            return self.get_dataset()
 
 except ImportError:
     TorchDataLoaderAdapter = None
@@ -155,20 +188,38 @@ try:
 
         """
 
-        def __init__(self, ds: Dataset, steps=-1):
+        def __init__(self, ds: Dataset):
             self._dataset = ds
 
-        def get_dataset(self):
-            def parse_tf_data_gen():
-                for batch in iter(self._dataset):
-                    batch = jax.tree_util.tree_map(lambda x: x.numpy(), batch)
-                    yield batch
-
-            return parse_tf_data_gen
-
         def __iter__(self):
-            g = self.get_dataset()
-            return g()
+            return self._dataset.as_numpy_iterator()
 
 except ImportError:
     TFDatasetAdapter = None
+
+
+class GeneratorAdapter:
+    def __init__(self, g):
+        self._generator = g
+
+    def __iter__(self):
+        return self._generator()
+
+
+class Peekable:
+    def __init__(self, iterator):
+        self.iterator = iterator
+        self.peeked = deque()
+
+    def __iter__(self):
+        return self.iterator
+
+    def __next__(self):
+        if self.peeked:
+            return self.peeked.popleft()
+        return next(self.iterator)
+
+    def peek(self, ahead=0):
+        while len(self.peeked) <= ahead:
+            self.peeked.append(next(self.iterator))
+        return self.peeked[ahead]

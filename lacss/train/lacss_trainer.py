@@ -3,23 +3,80 @@ from __future__ import annotations
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional, Union, Sequence
 
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
 from tqdm import tqdm
 
 import lacss.metrics
-from lacss.losses import (aux_size_loss, collaborator_border_loss,
-                          collaborator_segm_loss, lpn_loss, segmentation_loss)
 
-from ..modules import Lacss, LacssCollaborator
+from lacss.losses import (
+    aux_size_loss,
+    collaborator_border_loss,
+    collaborator_segm_loss,
+    lpn_loss,
+    segmentation_loss,
+)
+
+from ..modules import Lacss, UNet
 from ..typing import Array, Optimizer
 from .base_trainer import Trainer
 from .strategy import JIT
+from ..typing import *
 
+
+class LacssCollaborator(nn.Module):
+    """Collaborator module for semi-supervised Lacss training
+
+    Attributes:
+        conv_spec: conv-net specificaiton for cell border predicition
+        unet_spec: specification for unet, used to predict cell foreground
+        patch_size: patch size for the unet
+        n_cls: number of classes (cell types) of input images
+    """
+
+    conv_spec: Sequence[int] = (32, 32)
+    unet_spec: Sequence[int] = (16, 32, 64)
+    patch_size: int = 1
+    n_cls: int = 1
+
+    @nn.compact
+    def __call__(
+        self, image: ArrayLike, cls_id: Optional[ArrayLike] = None
+    ) -> DataDict:
+        assert cls_id is not None or self.n_cls == 1
+        c = cls_id.astype(int).squeeze() if cls_id is not None else 0
+
+        net = UNet(self.unet_spec, self.patch_size)
+        _, unet_out = net(image)
+
+        y = unet_out[str(net.start_level)]
+
+        fg = nn.Conv(self.n_cls, (3, 3))(y)
+        fg = fg[..., c]
+
+        if fg.shape != image.shape[:-1]:
+            fg = jax.image.resize(fg, image.shape[:-1], "linear")
+
+        y = image
+        for n_features in self.conv_spec:
+            y = nn.Conv(n_features, (3, 3), use_bias=False)(y)
+            y = nn.GroupNorm(num_groups=None, group_size=1, use_scale=False)(
+                y[None, ...]
+            )[0]
+            y = jax.nn.relu(y)
+
+        y = nn.Conv(self.n_cls, (3, 3))(y)
+        cb = y[..., c]
+
+        return dict(
+            fg_pred=fg,
+            edge_pred=cb,
+        )
 
 class _CKSModel(nn.Module):
     principal: Lacss
@@ -37,7 +94,7 @@ class _CKSModel(nn.Module):
         return outputs
 
 
-class LacssTrainer(Trainer):
+class LacssTrainer:
     """Main trainer class for Lacss"""
 
     default_lr: float = 0.001
@@ -71,97 +128,88 @@ class LacssTrainer(Trainer):
         else:
             collaborator = LacssCollaborator(**collaborator_config)
 
-        super().__init__(
-            model=_CKSModel(
-                principal=principal,
-                collaborator=collaborator,
-            ),
-            optimizer=optimizer,
-            seed=seed,
-            strategy=strategy,
+        self.model = _CKSModel(
+            principal=principal,
+            collaborator=collaborator,
         )
 
-        if self.optimizer is None:
-            self.optimizer = optax.adamw(LacssTrainer.default_lr)
+        self.optimizer = optimizer or optax.adamw(LacssTrainer.default_lr)
+        self.seed = seed
+        self.strategy = strategy
 
-        # self._cp_step = 0
+    def _train_to_next_interval(self, n_steps, trainer, train_iter, cpm, val_dataset):
+        for _ in tqdm(range(n_steps)):
+            next(train_iter)
 
-    def _train_to_next_interval(
-        self, train_iter, checkpoint_interval, checkpoint_dir, val_dataset
-    ):
-        cur_step = self.state.step
-        next_cp_step = (
-            (cur_step + checkpoint_interval)
-            // checkpoint_interval
-            * checkpoint_interval
-        )
+        print("Losses: " + repr(train_iter.loss_logs))
 
-        for _ in tqdm(range(cur_step, next_cp_step)):
-            logs = next(train_iter)
-
-        print(", ".join([f"{k}:{v:.4f}" for k, v in logs.items()]))
-
-        if checkpoint_dir is not None:
-            cps = [int(p.name.split("-")[-1]) for p in checkpoint_dir.glob("chkpt-*")]
-            cp_cnt = max(cps) + 1
-            self.checkpoint(checkpoint_dir / f"chkpt-{cp_cnt}")
-
-        if val_dataset is not None:
-            val_metrics = [
-                lacss.metrics.LoiAP([5, 2, 1]),
-                lacss.metrics.BoxAP([0.5, 0.75]),
-            ]
-
-            var_logs = self.test_and_compute(val_dataset, metrics=val_metrics)
-            for k, v in var_logs.items():
-                print(f"{k}: {v}")
-
-    def _validate(self, val_dataset):
-        if val_dataset is not None:
-            val_metrics = [
-                lacss.metrics.LoiAP([5, 2, 1]),
-                lacss.metrics.BoxAP([0.5, 0.75]),
-            ]
-
-            var_logs = self.test_and_compute(
-                val_dataset, metrics=val_metrics, strategy=JIT
+        if cpm is not None:
+            cpm.save(
+                (cpm.latest_step() or 0) + 1,
+                args=ocp.args.StandardSave(train_iter),
             )
+
+        if val_dataset is not None:
+            val_metrics = [
+                lacss.metrics.LoiAP([5, 2, 1]),
+                lacss.metrics.BoxAP([0.5, 0.75]),
+            ]
+
+            var_logs = trainer.compute_metrics(
+                val_dataset,
+                val_metrics,
+                dict(params=train_iter.parameters),
+            )
+
             for k, v in var_logs.items():
                 print(f"{k}: {v}")
 
-    def _make_checkpoint(self, train_iter, checkpoint_manager):
-        if checkpoint_manager is not None:
-            print(train_iter.send(("checkpoint", checkpoint_manager)))
+        train_iter.reset_loss_logs()
 
-    def _reset(
-        self,
-        cur_step,
-        warmup_steps: int = 0,
-        sigma: float = 20.0,
-        pi: float = 2.0,
-    ) -> None:
-        if cur_step >= warmup_steps:
-            col_seg_loss = partial(collaborator_segm_loss, sigma=sigma, pi=pi)
-            # col_seg_loss.name = "collaborator_segm_loss"
-            self.losses = [
-                lpn_loss,
-                segmentation_loss,
-                col_seg_loss,
-                collaborator_border_loss,
-                aux_size_loss,
-            ]
-        else:
-            pre_seg_loss = partial(segmentation_loss, pretraining=True)
-            pre_col_seg_loss = partial(collaborator_segm_loss, sigma=100.0, pi=1.0)
-            self.losses = [
-                lpn_loss,
-                pre_seg_loss,
-                pre_col_seg_loss,
-                collaborator_border_loss,
-                aux_size_loss,
-            ]
+    def _get_warmup_trainer(self, sigma, pi):
+        pre_seg_loss = partial(segmentation_loss, pretraining=True)
+        pre_col_seg_loss = partial(collaborator_segm_loss, sigma=100.0, pi=1.0)
+        losses = [
+            lpn_loss,
+            pre_seg_loss,
+            pre_col_seg_loss,
+            collaborator_border_loss,
+            aux_size_loss,
+        ]
+        return Trainer(
+            model=self.model,
+            losses=losses,
+            optimizer=self.optimizer,
+            seed=self.seed,
+            strategy=self.strategy,
+        )
 
-        self.reset()
+    def _get_trainer(self, sigma, pi):
+        col_seg_loss = partial(collaborator_segm_loss, sigma=sigma, pi=pi)
+        losses = [
+            lpn_loss,
+            segmentation_loss,
+            col_seg_loss,
+            collaborator_border_loss,
+            aux_size_loss,
+        ]
+        return Trainer(
+            model=self.model,
+            losses=losses,
+            optimizer=self.optimizer,
+            seed=self.seed,
+            strategy=self.strategy,
+        )
+
+    def get_init_params(self, dataset):
+        trainer = self._get_trainer(20.0, 2.0)
+        train_it = trainer.train(
+            dataset, 
+            rng_cols=["droppath"],
+            training=True,
+        )
+        return train_it.parameters
+
 
     def do_training(
         self,
@@ -174,6 +222,7 @@ class LacssTrainer(Trainer):
         warmup_steps: int = 0,
         sigma: float = 20.0,
         pi: float = 2.0,
+        init_vars = None,
     ) -> None:
         """Runing training.
 
@@ -210,8 +259,47 @@ class LacssTrainer(Trainer):
             sigma: Only for point-supervised training. Expected cell size
             pi: Only for point-supervised training. Amplitude of the prior term.
         """
-        train_iter = self.train(dataset, rng_cols=["droppath"], training=True)
         cur_step = 0
+
+        if cur_step < warmup_steps:
+            trainer = self._get_warmup_trainer(sigma, pi)
+            train_it = trainer.train(
+                dataset, 
+                rng_cols=["droppath"], 
+                init_vars=init_vars,
+                training=True,
+            )
+
+            while cur_step < warmup_steps:
+                next_cp_step = (
+                    (cur_step + validation_interval)
+                    // validation_interval
+                    * validation_interval
+                )
+
+                print(f"Current step {cur_step} going to {next_cp_step}")
+
+                self._train_to_next_interval(
+                    next_cp_step - cur_step,
+                    trainer,
+                    train_it,
+                    checkpoint_manager,
+                    val_dataset,
+                )
+
+                cur_step = next_cp_step
+
+                self.parameters = train_it.parameters
+
+            init_vars = dict(params=train_it.parameters)
+
+        trainer = self._get_trainer(sigma, pi)
+        train_it = trainer.train(
+            dataset,
+            rng_cols=["droppath"],
+            init_vars=init_vars,
+            training=True,
+        )
 
         while cur_step < n_steps:
             next_cp_step = (
@@ -220,24 +308,19 @@ class LacssTrainer(Trainer):
                 * validation_interval
             )
 
-            self._reset(
-                cur_step,
-                warmup_steps=warmup_steps,
-                sigma=sigma,
-                pi=pi,
-            )
-
             print(f"Current step {cur_step} going to {next_cp_step}")
-            for _ in tqdm(range(cur_step, next_cp_step)):
-                logs = next(train_iter)
+
+            self._train_to_next_interval(
+                next_cp_step - cur_step,
+                trainer,
+                train_it,
+                checkpoint_manager,
+                val_dataset,
+            )
 
             cur_step = next_cp_step
 
-            print(", ".join([f"{k}:{v:.4f}" for k, v in logs.items()]))
-            
-            self._make_checkpoint(train_iter, checkpoint_manager)
-            
-            self._validate(val_dataset)
+            self.parameters = train_it.parameters
 
 
     def save(self, save_path) -> None:
