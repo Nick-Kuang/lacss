@@ -13,8 +13,6 @@ from lacss.ops import patches_to_label, sorted_non_max_suppression
 
 from .predict import Predictor
 
-from cellpose import models,io
-
 app = typer.Typer(pretty_exceptions_enable=False)
 
 def read_input(st = sys.stdin.buffer):
@@ -73,12 +71,25 @@ def write_polygon_result(polygons, scores, st = sys.stdout.buffer):
     st.write(msg.SerializeToString())
 
 @app.command()
-def main():
-    
-    model = models.Cellpose(gpu = True, model_type="cyto")
+def main(modelpath: Path):
+    modelpath = str(modelpath)
+    if "!" in modelpath: # in a jar
+        jarfile, rscpath = modelpath.split("!")
+        with ZipFile(jarfile) as jar:
+            with jar.open(rscpath) as modelfile:
+                import pickle
+                modelpath = pickle.load(modelfile)
 
-    print(f"cellpose_server: loaded model defualt Cyto Model")
+    model = Predictor(modelpath)
+    model.detector.test_max_output = 512
+    model.detector.test_min_score = 0
 
+    print(f"lacss_server: loaded model from {modelpath}", file=sys.stderr)
+    print(f"lacss_server: default backend is {jax.default_backend()}", file=sys.stderr)
+    if (jax.default_backend() == "cpu"):
+        print(f"lacss_server: WARNING: No GPU configuration. This might be very slow ...", file=sys.stderr)
+
+    # cnt = 0
 
     while True:
         img, settings = read_input()
@@ -89,25 +100,40 @@ def main():
 
         print(f"received image {img.shape}", file=sys.stderr)
 
-        masks, flows, _, __ = model.eval(
+        preds = model.predict(
             img, 
+            min_area=settings.min_cell_area,
+            remove_out_of_bound=settings.remove_out_of_bound,
+            scaling=settings.scaling,
+            nms_iou=settings.nms_iou,
+            score_threshold=settings.detection_threshold,
+            segmentation_threshold=settings.segmentation_threshold,
+            output_type="contour" if settings.return_polygon else "label"
         )
 
+        if settings.return_polygon:
 
-        label = masks.astype("int")
-        scores = flows[:][2]
+            write_polygon_result(
+                preds["pred_contours"],
+                preds["pred_scores"],
+            )
 
-        assert label.max() == len(scores)
+        else:
 
-        assert len(label.shape) == 2
+            label = preds["pred_label"].astype("int")
+            scores = preds["pred_scores"]
 
-        # score image
-        score_img = scores[label - 1]
-        score_img *= (label > 0)
+            assert label.max() == len(scores)
 
-        assert score_img.shape == label.shape
+            assert len(label.shape) == 2
 
-        write_result(label, score_img)
+            # score image
+            score_img = scores[label - 1]
+            score_img *= (label > 0)
+
+            assert score_img.shape == label.shape
+
+            write_result(label, score_img)
 
         # imageio.imwrite(f"p_{cnt}.tif", np.asarray(label))
         # cnt+=1
