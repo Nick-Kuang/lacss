@@ -1,0 +1,24 @@
+from cellpose import models,io, plot
+import typer
+import numpy as np
+from pathlib import Path
+from os.path import join
+import pickle
+
+app = typer.Typer(pretty_exceptions_enable=False)
+
+
+
+@app.command()
+def main(image: np.ndarray, dir: Path):
+    
+    model = models.Cellpose(gpu = True, model_type="cyto")
+
+    masks, flows, __, ___ = model.eval(image, diameter = None, channels = [0,0])
+    f = open(join(dir, 'storage.pkl'), 'wb')
+    
+    pickle.dump([masks, flows, __, ___], f)
+    f.close()
+
+if __name__ == "__main__":
+    app()
